@@ -66,7 +66,10 @@ def _tritt_fwd_inner(
     for start_kv_2 in range(lo, hi, BLOCK_SIZE_KV):
         start_kv_2 = tl.multiple_of(start_kv_2, BLOCK_SIZE_KV)
         
-        k1_hi = tl.minimum(hi_1, start_kv_2 + BLOCK_SIZE_KV)
+        if STAGE <3:
+            k1_hi = tl.minimum(hi_1, start_kv_2 + BLOCK_SIZE_KV)
+        else:
+            k1_hi = hi
 
         K2_block = tl.load(K2_block_ptr)
         V2_block = tl.load(V2_block_ptr)

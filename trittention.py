@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import einops
 from slow_trittention import slow_tri
-from flash_trittention import tritt_fwd
+from tritt_fwd import tritt_fwd
 
 
 class Trittention(nn.Module):
@@ -24,14 +24,15 @@ class Trittention(nn.Module):
         bs, n_heads, seq_len, d_head = q.shape
         a, b, c, d, e = k1, k2, q, v1, v2
 
-        attn_score = torch.einsum("bnth, bnsh, bnqh -> bntsq", a,b,c)
-        attn_score = einops.rearrange(attn_score, "b n p1 p2 p3 -> b n p3 (p1 p2)")*softmax_scale
+        attn_score = torch.einsum("bnsh, bnth, bnqh -> bnstq", a,b,c)
         
-        # Apply causal mask if needed
         if causal:
             mask = self.create_causal_mask(seq_len).to(attn_score.device)
-            attn_score = attn_score.masked_fill(mask.expand(bs, n_heads, seq_len, seq_len*seq_len), float('-inf'))
+            attn_score = attn_score.masked_fill(mask, -1e9)
+        else:
+            attn_score = attn_score
         
+        attn_score = einops.rearrange(attn_score, "b n p1 p2 p3 -> b n p3 (p1 p2)")*softmax_scale
         max, _ = torch.max(attn_score, dim=-1, keepdim=True)
         attn_score = attn_score - max
         suma = torch.exp(attn_score).sum(dim=-1, keepdim=True)
