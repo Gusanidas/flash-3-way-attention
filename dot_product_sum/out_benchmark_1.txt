@@ -1,0 +1,319 @@
+Trittention Kernel Benchmark
+==================================================
+
+==================== Configuration 1 ====================
+Benchmarking configuration:
+  Batch size: 2, Seq len: 64
+  Heads: 4, Head dim: 32
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: True
+
+Benchmarking Triton implementation...
+  Forward:  0.071 ± 0.028 ms
+  Backward: 0.408 ± 0.012 ms
+  Total:    0.479 ms
+
+Benchmarking PyTorch implementation...
+  Forward:  0.631 ± 0.107 ms
+  Backward: 0.684 ± 0.121 ms
+  Total:    1.315 ms
+
+Triton speedup: 2.74x
+
+==================== Configuration 2 ====================
+Benchmarking configuration:
+  Batch size: 2, Seq len: 128
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: True
+
+Benchmarking Triton implementation...
+  Forward:  0.095 ± 0.004 ms
+  Backward: 0.929 ± 0.106 ms
+  Total:    1.024 ms
+
+Benchmarking PyTorch implementation...
+  Forward:  7.192 ± 15.499 ms
+  Backward: 1.851 ± 0.047 ms
+  Total:    9.044 ms
+
+Triton speedup: 8.83x
+
+==================== Configuration 3 ====================
+Benchmarking configuration:
+  Batch size: 4, Seq len: 256
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: True
+
+Benchmarking Triton implementation...
+  Forward:  0.260 ± 0.004 ms
+  Backward: 0.944 ± 0.006 ms
+  Total:    1.204 ms
+
+Benchmarking PyTorch implementation...
+  Forward:  39.117 ± 13.529 ms
+  Backward: 24.268 ± 0.013 ms
+  Total:    63.385 ms
+
+Triton speedup: 52.66x
+
+==================== Configuration 4 ====================
+Benchmarking configuration:
+  Batch size: 4, Seq len: 256
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.bfloat16
+  Benchmark PyTorch: True
+
+Benchmarking Triton implementation...
+  Forward:  0.201 ± 0.004 ms
+  Backward: 1.005 ± 0.036 ms
+  Total:    1.206 ms
+
+Benchmarking PyTorch implementation...
+  Forward:  31.137 ± 16.324 ms
+  Backward: 14.410 ± 0.065 ms
+  Total:    45.547 ms
+
+Triton speedup: 37.78x
+
+==================== Configuration 5 ====================
+Benchmarking configuration:
+  Batch size: 4, Seq len: 256
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: True
+
+Benchmarking Triton implementation...
+  Forward:  0.174 ± 0.003 ms
+  Backward: 0.774 ± 0.019 ms
+  Total:    0.947 ms
+
+Benchmarking PyTorch implementation...
+  Forward:  38.367 ± 13.266 ms
+  Backward: 24.279 ± 0.011 ms
+  Total:    62.646 ms
+
+Triton speedup: 66.12x
+
+==================== Configuration 6 ====================
+Benchmarking configuration:
+  Batch size: 4, Seq len: 256
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.bfloat16
+  Benchmark PyTorch: True
+
+Benchmarking Triton implementation...
+  Forward:  0.136 ± 0.005 ms
+  Backward: 0.710 ± 0.009 ms
+  Total:    0.846 ms
+
+Benchmarking PyTorch implementation...
+  Forward:  32.986 ± 16.530 ms
+  Backward: 15.990 ± 6.297 ms
+  Total:    48.975 ms
+
+Triton speedup: 57.88x
+
+==================== Configuration 7 ====================
+Benchmarking configuration:
+  Batch size: 2, Seq len: 512
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: True
+
+Benchmarking Triton implementation...
+  Forward:  0.748 ± 0.015 ms
+  Backward: 2.715 ± 0.014 ms
+  Total:    3.463 ms
+
+Benchmarking PyTorch implementation...
+  Error: CUDA out of memory. Tried to allocate 8.00 GiB. GPU 0 has a total capacity of 79.19 GiB of which 4.72 GiB is free. Process 4117226 has 74.46 GiB memory in use. Of the allocated memory 66.38 GiB is allocated by PyTorch, and 6.88 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+  Error traceback: Traceback (most recent call last):
+  File "/root/tritt/benchmark_trittention.py", line 240, in run_benchmark
+    fwd_time_mean, fwd_time_std = benchmark_forward_pass(
+                                  ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/tritt/benchmark_trittention.py", line 50, in benchmark_forward_pass
+    output = model(q, k1, k2, v1, v2)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/tritt/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/tritt/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/tritt/trittention_pytorch.py", line 73, in forward
+    attn_score2 = torch.exp(attn_score) / L.unsqueeze(-1)
+                  ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 8.00 GiB. GPU 0 has a total capacity of 79.19 GiB of which 4.72 GiB is free. Process 4117226 has 74.46 GiB memory in use. Of the allocated memory 66.38 GiB is allocated by PyTorch, and 6.88 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+
+==================== Configuration 8 ====================
+Large seq_len detected, disabling PyTorch benchmarking to avoid OOM
+Benchmarking configuration:
+  Batch size: 1, Seq len: 1024
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: False
+
+Benchmarking Triton implementation...
+  Forward:  2.514 ± 0.028 ms
+  Backward: 7.347 ± 0.088 ms
+  Total:    9.861 ms
+
+==================== Configuration 9 ====================
+Large seq_len detected, disabling PyTorch benchmarking to avoid OOM
+Benchmarking configuration:
+  Batch size: 1, Seq len: 2048
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: False
+
+Benchmarking Triton implementation...
+  Forward:  12.456 ± 0.188 ms
+  Backward: 33.963 ± 0.191 ms
+  Total:    46.419 ms
+
+==================== Configuration 10 ====================
+Large seq_len detected, disabling PyTorch benchmarking to avoid OOM
+Benchmarking configuration:
+  Batch size: 1, Seq len: 2048
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: False
+
+Benchmarking Triton implementation...
+  Forward:  3.111 ± 0.039 ms
+  Backward: 10.375 ± 0.090 ms
+  Total:    13.485 ms
+
+==================== Configuration 11 ====================
+Large seq_len detected, disabling PyTorch benchmarking to avoid OOM
+Benchmarking configuration:
+  Batch size: 1, Seq len: 4096
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: False
+
+Benchmarking Triton implementation...
+  Forward:  82.511 ± 0.617 ms
+  Backward: 244.661 ± 1.256 ms
+  Total:    327.173 ms
+
+==================== Configuration 12 ====================
+Large seq_len detected, disabling PyTorch benchmarking to avoid OOM
+Benchmarking configuration:
+  Batch size: 1, Seq len: 4096
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: False
+
+Benchmarking Triton implementation...
+  Forward:  10.837 ± 0.137 ms
+  Backward: 38.939 ± 0.139 ms
+  Total:    49.776 ms
+
+==================== Configuration 13 ====================
+Large seq_len detected, disabling PyTorch benchmarking to avoid OOM
+Benchmarking configuration:
+  Batch size: 1, Seq len: 8192
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: False
+
+Benchmarking Triton implementation...
+  Forward:  393.849 ± 1.187 ms
+  Backward: 1273.015 ± 2.479 ms
+  Total:    1666.864 ms
+
+==================== Configuration 14 ====================
+Large seq_len detected, disabling PyTorch benchmarking to avoid OOM
+Benchmarking configuration:
+  Batch size: 1, Seq len: 8192
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.float32
+  Benchmark PyTorch: False
+
+Benchmarking Triton implementation...
+  Forward:  39.779 ± 0.129 ms
+  Backward: 154.558 ± 0.176 ms
+  Total:    194.338 ms
+
+==================== Configuration 15 ====================
+Large seq_len detected, disabling PyTorch benchmarking to avoid OOM
+Benchmarking configuration:
+  Batch size: 1, Seq len: 4096
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.bfloat16
+  Benchmark PyTorch: False
+
+Benchmarking Triton implementation...
+  Forward:  55.028 ± 0.582 ms
+  Backward: 207.147 ± 1.030 ms
+  Total:    262.176 ms
+
+==================== Configuration 16 ====================
+Large seq_len detected, disabling PyTorch benchmarking to avoid OOM
+Benchmarking configuration:
+  Batch size: 1, Seq len: 4096
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.bfloat16
+  Benchmark PyTorch: False
+
+Benchmarking Triton implementation...
+  Forward:  7.167 ± 0.065 ms
+  Backward: 33.102 ± 0.051 ms
+  Total:    40.269 ms
+
+==================== Configuration 17 ====================
+Large seq_len detected, disabling PyTorch benchmarking to avoid OOM
+Benchmarking configuration:
+  Batch size: 1, Seq len: 8192
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.bfloat16
+  Benchmark PyTorch: False
+
+Benchmarking Triton implementation...
+  Forward:  251.775 ± 1.428 ms
+  Backward: 1072.194 ± 1.060 ms
+  Total:    1323.969 ms
+
+==================== Configuration 18 ====================
+Large seq_len detected, disabling PyTorch benchmarking to avoid OOM
+Benchmarking configuration:
+  Batch size: 1, Seq len: 8192
+  Heads: 8, Head dim: 64
+  Causal: True, Device: cuda, Dtype: torch.bfloat16
+  Benchmark PyTorch: False
+
+Benchmarking Triton implementation...
+  Forward:  25.894 ± 0.113 ms
+  Backward: 129.773 ± 0.241 ms
+  Total:    155.667 ms
+
+==================================================
+BENCHMARK SUMMARY
+==================================================
+Config   Seq Len  K_diff   Dtype        Triton (ms)  PyTorch (ms)  Speedup 
+--------------------------------------------------------------------------------
+1        64       1024     float32      0.5          1.3           2.74x   
+2        128      1024     float32      1.0          9.0           8.83x   
+3        256      1024     float32      1.2          63.4          52.66x  
+4        256      1024     bfloat16     1.2          45.5          37.78x  
+5        256      40       float32      0.9          62.6          66.12x  
+6        256      40       bfloat16     0.8          49.0          57.88x  
+7        512      N/A      float32      3.5          SKIP/FAIL     N/A     
+8        1024     N/A      float32      9.9          SKIP/FAIL     N/A     
+9        2048     1024     float32      46.4         SKIP/FAIL     N/A     
+10       2048     128      float32      13.5         SKIP/FAIL     N/A     
+11       4096     2048     float32      327.2        SKIP/FAIL     N/A     
+12       4096     128      float32      49.8         SKIP/FAIL     N/A     
+13       8192     2048     float32      1666.9       SKIP/FAIL     N/A     
+14       8192     128      float32      194.3        SKIP/FAIL     N/A     
+15       4096     2048     bfloat16     262.2        SKIP/FAIL     N/A     
+16       4096     128      bfloat16     40.3         SKIP/FAIL     N/A     
+17       8192     2048     bfloat16     1324.0       SKIP/FAIL     N/A     
+18       8192     128      bfloat16     155.7        SKIP/FAIL     N/A     
+
+==================================================
+Benchmark completed!

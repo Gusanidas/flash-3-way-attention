@@ -1,0 +1,2 @@
+both in bwd_dq_kernel.py and bwd_dk1_dv1_kernel.py, we are treating the argument "convert_to_float32" as referring to the precision we store the tensors at the end.
+Change the code. If convert_to_float32 is True, we should convert the tensors to float32 when loading them (like it is done now), if not then we should leave them as is.
