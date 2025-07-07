@@ -314,7 +314,7 @@ def main():
     print("Trittention Kernel Benchmark")
     print("=" * 50)
 
-    input_precision = "tf32x3"
+    input_precision = None  # "tf32x3"
     convert_to_float32 = False
 
     # Test configurations

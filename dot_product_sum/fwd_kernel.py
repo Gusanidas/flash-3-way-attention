@@ -12,7 +12,7 @@ def get_autotune_config(short=SHORT_CONFIG):
             triton.Config(
                 {"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=3, num_warps=8
             )
-            for bq in [32]
+            for bq in [16]
             for bkv in [32]
         ]
     else:
@@ -91,7 +91,7 @@ def _tritt_fwd_inner(
         mask_k2 = current_offs_k2_seq < SEQ_LEN
         K2_block = tl.load(current_k2_block_ptr, mask=mask_k2[None, :], other=0.0)
 
-        acc_o1 = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
+        acc_k1k2_v1 = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
         m_jk = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32)
         l_jk = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32)
         local_m = 0.0
@@ -141,19 +141,21 @@ def _tritt_fwd_inner(
             m = tl.max(m_jk)
             K1K2_block -= m
 
-            Pk_block = tl.math.exp(K1K2_block)
+            P_k1k2_block = tl.math.exp(K1K2_block)
             v1_f32 = V1_block.to(tl.float32)
             v1_f32 = v1_f32 * tl.sigmoid(v1_f32)
             V1_block = v1_f32.to(V1_block.type.element_ty)
             alpha = tl.math.exp(local_m - m)
-            Pk_block = Pk_block.to(V1_block.type.element_ty)
+            P_k1k2_block = P_k1k2_block.to(V1_block.type.element_ty)
             if input_precision is not None:
-                acc_o1 = acc_o1 * alpha + tl.dot(
-                    tl.trans(Pk_block), V1_block, input_precision=input_precision
+                acc_k1k2_v1 = acc_k1k2_v1 * alpha + tl.dot(
+                    tl.trans(P_k1k2_block), V1_block, input_precision=input_precision
                 )
             else:
-                acc_o1 = acc_o1 * alpha + tl.dot(tl.trans(Pk_block), V1_block)
-            l_jk = l_jk * alpha + tl.sum(Pk_block, axis=0)
+                acc_k1k2_v1 = acc_k1k2_v1 * alpha + tl.dot(
+                    tl.trans(P_k1k2_block), V1_block
+                )
+            l_jk = l_jk * alpha + tl.sum(P_k1k2_block, axis=0)
             local_m = m
 
         current_offs_v2_seq = start_kv_2 + tl.arange(0, BLOCK_SIZE_KV)
@@ -166,7 +168,7 @@ def _tritt_fwd_inner(
         mask_v2 = current_offs_v2_seq < SEQ_LEN
         V2_block = tl.load(current_v2_block_ptr, mask=mask_v2[:, None], other=0.0)
 
-        o1 = acc_o1 * V2_block * tl.math.exp(local_m)
+        o1 = acc_k1k2_v1 * V2_block * tl.math.exp(local_m)
         l_jk = l_jk * tl.math.exp(local_m)
 
         if input_precision is not None:

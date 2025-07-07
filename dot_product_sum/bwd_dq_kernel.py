@@ -16,7 +16,7 @@ def get_autotune_config(short=SHORT_CONFIG):
             triton.Config(
                 {"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=3, num_warps=8
             )
-            for bq in [32]
+            for bq in [16]
             for bkv in [32]
         ]
     else:
@@ -24,10 +24,10 @@ def get_autotune_config(short=SHORT_CONFIG):
             triton.Config(
                 {"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=ns, num_warps=nw
             )
-            for bq in [16, 32, 64, 128]
-            for bkv in [16, 32, 64, 128]
-            for ns in [1, 2, 3]
-            for nw in [1, 2, 4, 8]
+            for bq in [16, 32, 64]
+            for bkv in [16, 32, 64]
+            for ns in [2, 3]
+            for nw in [2, 4, 8]
         ]
 
 
@@ -203,20 +203,8 @@ def _tritt_bwd_dq(
         if convert_to_float32:
             K2_block = K2_block.to(tl.float32)
 
-        acc_k2v1 = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
-        acc_pk2 = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32)
-
-        current_offs_v2_seq = start_kv_2 + tl.arange(0, BLOCK_SIZE_KV)
-        current_v2_block_ptr = (
-            V2
-            + offset_v2
-            + current_offs_v2_seq[None, :] * v2_strideS
-            + tl.arange(0, HEAD_DIM)[:, None] * v2_strideD
-        )
-        mask_v2 = current_offs_v2_seq < SEQ_LEN
-        V2_block = tl.load(current_v2_block_ptr, mask=mask_v2[None, :], other=0.0)
-        if convert_to_float32:
-            V2_block = V2_block.to(tl.float32)
+        acc_k1k2_v1 = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
+        acc_pk2_k1 = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32)
 
         for start_kv_1 in range(lo_1, k1_hi, BLOCK_SIZE_KV):
             start_kv_1 = tl.multiple_of(start_kv_1, BLOCK_SIZE_KV)
@@ -268,16 +256,16 @@ def _tritt_bwd_dq(
             K1K2_block = K1K2_block * softmax_scale - 0.5 * avg_m
 
             K1K2_block = tl.where(mask_k1_k2, K1K2_block, float("-inf"))
-            Pk_block = tl.math.exp(K1K2_block)
-            Pk_block = Pk_block * tl.where(mask_k1_k2, 1, 0)
-            Pk_block = Pk_block.to(dO_block.dtype)
+            P_k1k2_block = tl.math.exp(K1K2_block)
+            # Pk_block = Pk_block * tl.where(mask_k1_k2, 1, 0)
+            P_k1k2_block = P_k1k2_block.to(dO_block.dtype)
             if input_precision is not None:
-                acc_k2v1 += tl.trans(
-                    tl.dot(V1_block, Pk_block, input_precision=input_precision)
+                acc_k1k2_v1 += tl.trans(
+                    tl.dot(V1_block, P_k1k2_block, input_precision=input_precision)
                 )
             else:
-                acc_k2v1 += tl.trans(tl.dot(V1_block, Pk_block))
-            acc_pk2 += tl.sum(Pk_block, 0)
+                acc_k1k2_v1 += tl.trans(tl.dot(V1_block, P_k1k2_block))
+            acc_pk2_k1 += tl.sum(P_k1k2_block, 0)
 
         if input_precision is not None:
             QK2_block = tl.dot(Q_block, K2_block, input_precision=input_precision)
@@ -290,38 +278,49 @@ def _tritt_bwd_dq(
 
         QK2_block = QK2_block * softmax_scale - m_q[:, None]
         QK2_block = tl.where(mask_q_k2, QK2_block, float("-inf"))
-        P_qk = tl.math.exp(QK2_block)
-        P_qk = P_qk * tl.where(mask_q_k2, 1, 0)
-        P_v1v2 = acc_k2v1 * tl.trans(V2_block)
+        P_qk2 = tl.math.exp(QK2_block)
+        # P_qk = P_qk * tl.where(mask_q_k2, 1, 0)
+        current_offs_v2_seq = start_kv_2 + tl.arange(0, BLOCK_SIZE_KV)
+        current_v2_block_ptr = (
+            V2
+            + offset_v2
+            + current_offs_v2_seq[:, None] * v2_strideS
+            + tl.arange(0, HEAD_DIM)[None, :] * v2_strideD
+        )
+        mask_v2 = current_offs_v2_seq < SEQ_LEN
+        V2_block = tl.load(current_v2_block_ptr, mask=mask_v2[:, None], other=0.0)
+        if convert_to_float32:
+            V2_block = V2_block.to(tl.float32)
+        dS_v1v2 = acc_k1k2_v1 * V2_block
         if not convert_to_float32:
-            P_v1v2 = P_v1v2.to(Q_block.dtype)
-            P_qk = P_qk.to(Q_block.dtype)
+            dS_v1v2 = dS_v1v2.to(Q_block.dtype)
+            P_qk2 = P_qk2.to(Q_block.dtype)
         if input_precision is not None:
-            P_tot = P_qk * tl.dot(
-                dO_block, tl.trans(P_v1v2), input_precision=input_precision
+            dS_left = P_qk2 * tl.dot(
+                dO_block, tl.trans(dS_v1v2), input_precision=input_precision
             )
         else:
-            P_tot = P_qk * tl.dot(dO_block, tl.trans(P_v1v2))
-        P_d = P_qk * D_block[:, None] * acc_pk2[None, :]
+            dS_left = P_qk2 * tl.dot(dO_block, tl.trans(dS_v1v2))
+        dS_right = P_qk2 * D_block[:, None] * acc_pk2_k1[None, :]
 
-        P_qk_ds = P_tot - P_d
-        P_qk_ds = P_qk_ds * tl.exp(0.5 * (avg_m))
+        dS = dS_left - dS_right
+        dS = dS * tl.exp(0.5 * (avg_m))
         if not convert_to_float32:
-            P_qk_ds = P_qk_ds.to(K2_block.dtype)
+            dS = dS.to(K2_block.dtype)
         if input_precision is not None:
             dQ_block += softmax_scale * tl.dot(
-                P_qk_ds, tl.trans(K2_block), input_precision=input_precision
+                dS, tl.trans(K2_block), input_precision=input_precision
             )
         else:
-            dQ_block += softmax_scale * tl.dot(P_qk_ds, tl.trans(K2_block))
+            dQ_block += softmax_scale * tl.dot(dS, tl.trans(K2_block))
 
         # Accumulate dK2 gradients from Q-K2 path
         if input_precision is not None:
             acc_dK2_from_qk = softmax_scale * tl.dot(
-                tl.trans(P_qk_ds), Q_block, input_precision=input_precision
+                tl.trans(dS), Q_block, input_precision=input_precision
             )
         else:
-            acc_dK2_from_qk = softmax_scale * tl.dot(tl.trans(P_qk_ds), Q_block)
+            acc_dK2_from_qk = softmax_scale * tl.dot(tl.trans(dS), Q_block)
 
         # Write dK2 gradients from Q-K2 path using atomic_add
         current_dK2_block_ptr = (

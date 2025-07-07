@@ -16,7 +16,7 @@ def get_autotune_config(short=SHORT_CONFIG):
             triton.Config(
                 {"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=3, num_warps=8
             )
-            for bq in [32]
+            for bq in [16]
             for bkv in [32]
         ]
     else:
@@ -24,10 +24,10 @@ def get_autotune_config(short=SHORT_CONFIG):
             triton.Config(
                 {"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=ns, num_warps=nw
             )
-            for bq in [16, 32, 64, 128]
-            for bkv in [16, 32, 64, 128]
-            for ns in [1, 2, 3]
-            for nw in [1, 2, 4, 8]
+            for bq in [16, 32, 64]
+            for bkv in [16, 32, 64]
+            for ns in [2, 3]
+            for nw in [2, 4, 8]
         ]
 
 
@@ -203,8 +203,9 @@ def _tritt_bwd_dk1_dv1(
             V2_block = V2_block.to(tl.float32)
 
         acc_QK2O = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
-        acc_QDK2 = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32)
-        acc_dv = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
+        # For the term that will be subtracted.
+        acc_QDK2_sub = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32)
+        acc_dOv1 = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
 
         # Define looping limits for q
         if CAUSAL:
@@ -291,13 +292,13 @@ def _tritt_bwd_dk1_dv1(
                 )
             else:
                 acc_QK2O += tl.dot(tl.trans(PQK2_block), dO_block)
-            acc_QDK2 += tl.sum(PQK2_block * D_block[:, None], 0)
+            acc_QDK2_sub += tl.sum(PQK2_block * D_block[:, None], 0)
 
             # dv += PQK2 * dO and sum along the q dimension
-            acc_dv += tl.sum(
-                PQK2_block[:, :, None] * dO_block[:, None, :], 0
-            )  # tl dot?
-            # acc_dv = tl.dot(tl.trans(PQK2_block), dO_block)
+            # acc_dv += tl.sum(
+            #    PQK2_block[:, :, None] * dO_block[:, None, :], 0
+            # )  # tl dot?
+            acc_dOv1 += tl.dot(tl.trans(PQK2_block), dO_block)
 
         # K1K2 = tl.dot(K1, K2) * softmax_scale
         if input_precision is not None:
@@ -321,7 +322,7 @@ def _tritt_bwd_dk1_dv1(
 
         dV1_acc += tl.sum(
             PK1K2_block[:, :, None]
-            * acc_dv[None, :, :]
+            * acc_dOv1[None, :, :]
             * tl.trans(V2_block)[None, :, :],
             1,
         )
@@ -329,7 +330,7 @@ def _tritt_bwd_dk1_dv1(
         # Compute dV2 contribution for this k2 block
         dV2_contrib = tl.sum(
             PK1K2_block[:, :, None]
-            * acc_dv[None, :, :]
+            * acc_dOv1[None, :, :]
             * tl.trans(V1_block)[:, None, :],
             0,
         )
@@ -351,8 +352,8 @@ def _tritt_bwd_dk1_dv1(
             dS_k1 = tl.dot(acc_QK20, V1_block, input_precision=input_precision)
         else:
             dS_k1 = tl.dot(acc_QK20, V1_block)
-        # dS_k1 = tl.dot(acc_dv, V1_block)
-        dS_k1 -= acc_QDK2[:, None]
+
+        dS_k1 -= acc_QDK2_sub[:, None]
 
         # dK1 += PK1K2_block * dS_k1 @ K2_block
         if not convert_to_float32:

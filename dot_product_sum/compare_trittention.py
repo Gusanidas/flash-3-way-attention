@@ -64,6 +64,8 @@ def run_comparison(
     k_diff: int = 1024,
     input_precision: Optional[str] = None,
     convert_to_float32: bool = False,
+    input_std: float = 1.0,
+    grad_std: float = 1.0,
 ) -> Dict[str, Any]:
     """Run comprehensive comparison between Triton and PyTorch implementations."""
 
@@ -87,51 +89,72 @@ def run_comparison(
 
     # Generate random input tensors: q, k1, k2, v1, v2
     torch.manual_seed(42)
-    q = torch.randn(
-        batch_size,
-        num_heads,
-        seq_len,
-        head_dim,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
+    q = (
+        torch.randn(
+            batch_size,
+            num_heads,
+            seq_len,
+            head_dim,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        * input_std
     )
-    k1 = torch.randn(
-        batch_size,
-        num_heads,
-        seq_len,
-        head_dim,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
+    k1 = (
+        torch.randn(
+            batch_size,
+            num_heads,
+            seq_len,
+            head_dim,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        * input_std
     )
-    k2 = torch.randn(
-        batch_size,
-        num_heads,
-        seq_len,
-        head_dim,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
+    k2 = (
+        torch.randn(
+            batch_size,
+            num_heads,
+            seq_len,
+            head_dim,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        * input_std
     )
-    v1 = torch.randn(
-        batch_size,
-        num_heads,
-        seq_len,
-        head_dim,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
+    v1 = (
+        torch.randn(
+            batch_size,
+            num_heads,
+            seq_len,
+            head_dim,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        * input_std
     )
-    v2 = torch.randn(
-        batch_size,
-        num_heads,
-        seq_len,
-        head_dim,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
+    v2 = (
+        torch.randn(
+            batch_size,
+            num_heads,
+            seq_len,
+            head_dim,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        * input_std
     )
+
+    q = q.clone().detach().requires_grad_(True)
+    k1 = k1.clone().detach().requires_grad_(True)
+    k2 = k2.clone().detach().requires_grad_(True)
+    v1 = v1.clone().detach().requires_grad_(True)
+    v2 = v2.clone().detach().requires_grad_(True)
 
     # Clone tensors for PyTorch model (to ensure same inputs but separate gradients)
     q_pytorch = q.clone().detach().requires_grad_(True)
@@ -176,10 +199,9 @@ def run_comparison(
     print("\n=== BACKWARD PASS ===")
 
     # Create gradient for backward pass - use same dO for both
-    grad_output = torch.randn_like(triton_out)
-
+    grad_output = torch.randn_like(triton_out) * grad_std
     # Triton backward
-    triton_out.backward(grad_output, retain_graph=True)
+    triton_out.backward(grad_output.clone(), retain_graph=True)
     triton_grad_q = q.grad.clone()
     triton_grad_k1 = k1.grad.clone()
     triton_grad_k2 = k2.grad.clone()
@@ -246,7 +268,10 @@ def main():
     print("=" * 50)
 
     input_precision = "tf32x3"
-    convert_to_float32 = False
+    convert_to_float32 = True
+
+    input_std = 4.0
+    grad_std = 1.0
 
     # Test configurations
     configs = [
@@ -330,7 +355,12 @@ def main():
     for i, config in enumerate(configs):
         print(f"\n{'='*20} Configuration {i+1} {'='*20}")
         try:
-            stats = run_comparison(device=device, **config)
+            stats = run_comparison(
+                device=device,
+                **config,
+                input_std=input_std,
+                grad_std=grad_std,
+            )
             print(f"\nConfiguration {i+1} completed successfully!")
 
         except Exception as e:

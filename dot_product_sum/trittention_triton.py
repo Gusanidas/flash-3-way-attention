@@ -11,28 +11,6 @@ from bwd_dq_kernel import _tritt_bwd_dq
 from bwd_dk1_dv1_kernel import _tritt_bwd_dk1_dv1
 from bwd_preprocess import _tritt_bwd_preprocess
 
-# Configuration for autotuning
-SHORT_CONFIG = False  # Set to True for faster development, False for production
-
-
-def get_autotune_config(short=SHORT_CONFIG):
-    if short:
-        return [
-            triton.Config(
-                {"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=3, num_warps=8
-            )
-            for bq in [32]
-            for bkv in [32]
-        ]
-    else:
-        return [
-            triton.Config(
-                {"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=3, num_warps=8
-            )
-            for bq in [16, 32, 64, 128]
-            for bkv in [16, 32, 64, 128]
-        ]
-
 
 class TrittentionTritonFunction(torch.autograd.Function):
     @staticmethod
@@ -183,7 +161,7 @@ class TrittentionTritonFunction(torch.autograd.Function):
         dv2_strides = dv2.stride()
 
         # === DEFINE BLOCK, GRID AND CALL PREPROCESSING KERNEL ===
-        BLOCK_SIZE_Q_PREPROCESS = 32
+        BLOCK_SIZE_Q_PREPROCESS = 16
         grid_preprocess = (
             triton.cdiv(SEQ_LEN, BLOCK_SIZE_Q_PREPROCESS),
             BATCH_SIZE * NUM_HEADS,
@@ -206,8 +184,6 @@ class TrittentionTritonFunction(torch.autograd.Function):
         d_strides = d.stride()
 
         # === DEFINE BLOCK, GRID AND CALL DQ KERNEL ===
-        BLOCK_SIZE_Q_DQ = 32
-        BLOCK_SIZE_KV_DQ = 32
         grid_dq = lambda META: (
             triton.cdiv(SEQ_LEN, META["BLOCK_SIZE_Q"]),
             BATCH_SIZE * NUM_HEADS,
@@ -283,9 +259,10 @@ class TrittentionTritonFunction(torch.autograd.Function):
         )
 
         # === DEFINE BLOCK, GRID AND CALL DK1_DV1 KERNEL ===
-        BLOCK_SIZE_Q_DK1 = 32
-        BLOCK_SIZE_KV_DK1 = 32
-        grid_dk1_dv1 = (BATCH_SIZE * NUM_HEADS, triton.cdiv(SEQ_LEN, BLOCK_SIZE_KV_DK1))
+        grid_dk1_dv1 = lambda META: (
+            BATCH_SIZE * NUM_HEADS,
+            triton.cdiv(SEQ_LEN, META["BLOCK_SIZE_KV"]),
+        )
 
         _tritt_bwd_dk1_dv1[grid_dk1_dv1](
             q,
@@ -368,6 +345,9 @@ class TrittentionTritonFunction(torch.autograd.Function):
         dv2 = dv2.to(dtype)
 
         # === RETURN THE OUTPUT ===
+        print(
+            f"Return dq: {dq.shape}, dk1: {dk1.shape}, dk2: {dk2.shape}, dv1: {dv1.shape}, dv2: {dv2.shape}"
+        )
         return dq, dk1, dk2, dv1, dv2, None, None, None, None, None
 
 
