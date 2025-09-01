@@ -14,8 +14,8 @@ import os
 
 # Current directory is already dot_product_sum, no need to add path
 
-from trittention_triton import TrittentionTriton
-from trittention_pytorch import Trittention_pytorch
+from flash_trittention.dot_product_sum.trittention_triton import TrittentionTriton
+from flash_trittention.dot_product_sum.trittention_pytorch import Trittention_pytorch
 
 
 def compute_statistics(

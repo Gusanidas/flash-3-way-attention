@@ -1,11 +1,7 @@
-# @title Dq
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import einops
 import triton
 import triton.language as tl
-import numpy as np
 
 SHORT_CONFIG = True  # Set to True for faster development, False for production
 
@@ -257,7 +253,6 @@ def _tritt_bwd_dq(
 
             K1K2_block = tl.where(mask_k1_k2, K1K2_block, float("-inf"))
             P_k1k2_block = tl.math.exp(K1K2_block)
-            # Pk_block = Pk_block * tl.where(mask_k1_k2, 1, 0)
             P_k1k2_block = P_k1k2_block.to(dO_block.dtype)
             if input_precision is not None:
                 acc_k1k2_v1 += tl.trans(
@@ -481,72 +476,3 @@ def tritt_bwd_dq(
     )
 
     return dQ, dK2
-
-
-if __name__ == "__main__":
-    # Test the backward dQ kernel with small inputs
-    torch.manual_seed(42)
-
-    # Small test dimensions
-    BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = 1, 2, 30, 32
-    causal = False
-    device = "cuda"
-    dtype = torch.bfloat16
-
-    # Create random test inputs
-    Q = torch.randn(
-        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, dtype=dtype, device=device
-    )
-    K1 = torch.randn(
-        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, dtype=dtype, device=device
-    )
-    K2 = torch.randn(
-        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, dtype=dtype, device=device
-    )
-    V1 = torch.randn(
-        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, dtype=dtype, device=device
-    )
-    V2 = torch.randn(
-        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, dtype=dtype, device=device
-    )
-
-    # D and M should have shape [BATCH_SIZE, NUM_HEADS, SEQ_LEN]
-    D = torch.randn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, dtype=dtype, device=device)
-    M = torch.randn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, dtype=dtype, device=device)
-
-    # dO (gradient of output) has same shape as Q
-    dO = torch.randn(
-        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, dtype=dtype, device=device
-    )
-
-    softmax_scale = 1.0 / (HEAD_DIM**0.5)
-    softmax_scale = 1.0
-
-    print("Testing tritt_bwd_dq function...")
-    print(f"Input shapes: Q={Q.shape}, K1={K1.shape}, K2={K2.shape}")
-    print(f"V1={V1.shape}, V2={V2.shape}, D={D.shape}, M={M.shape}, dO={dO.shape}")
-
-    # Test non-causal case
-    try:
-        dQ, dK2 = tritt_bwd_dq(Q, K1, K2, V1, V2, D, softmax_scale, dO, M, causal=False)
-        print(f"Non-causal dQ shape: {dQ.shape}, dK2 shape: {dK2.shape}")
-        print(f"Non-causal dQ mean: {dQ.mean().item():.6f}, std: {dQ.std().item():.6f}")
-        print(
-            f"Non-causal dK2 mean: {dK2.mean().item():.6f}, std: {dK2.std().item():.6f}"
-        )
-    except Exception as e:
-        print(f"Non-causal test failed: {e}")
-
-    # Test causal case
-    dQ_causal, dK2_causal = tritt_bwd_dq(
-        Q, K1, K2, V1, V2, D, softmax_scale, dO, M, causal=True
-    )
-    print(f"Causal dQ shape: {dQ_causal.shape}, dK2 shape: {dK2_causal.shape}")
-    print(
-        f"Causal dQ mean: {dQ_causal.mean().item():.6f}, std: {dQ_causal.std().item():.6f}"
-    )
-    print(
-        f"Causal dK2 mean: {dK2_causal.mean().item():.6f}, std: {dK2_causal.std().item():.6f}"
-    )
-
-    print("Test completed!")

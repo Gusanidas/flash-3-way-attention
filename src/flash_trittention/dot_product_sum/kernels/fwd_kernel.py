@@ -244,7 +244,6 @@ def _tritt_fwd(
         + index_head.to(tl.int64) * stride_Q_head
     )
 
-    # Direct pointer arithmetic for Q and O (no block pointers)
     offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
 
     q_block_ptr = (
@@ -422,28 +421,8 @@ def tritt_fwd(Q, K1, K2, V1, V2, causal, softmax_scale, k_diff=2048):
         NUM_HEADS=NUM_HEADS,
         SEQ_LEN=SEQ_LEN,
         HEAD_DIM=HEAD_DIM,
-        STAGE=STAGE,  # Pass the STAGE parameter
+        STAGE=STAGE,
         k_diff=k_diff,
     )
 
     return O, M
-
-
-if __name__ == "__main__":
-    head_dim = 64
-    device = "cuda"
-    q = torch.randn(1, 8, 16, head_dim, device=device)
-    k1 = torch.randn(1, 8, 16, head_dim, device=device)
-    k2 = torch.randn(1, 8, 16, head_dim, device=device)
-    v1 = torch.randn(1, 8, 16, head_dim, device=device)
-    v2 = torch.randn(1, 8, 16, head_dim, device=device)
-
-    # Test causal attention
-    tritt_out_causal, _ = tritt_fwd(q, k1, k2, v1, v2, causal=True, softmax_scale=1.0)
-    print("Causal output shape:", tritt_out_causal.shape)
-
-    # Test non-causal attention
-    tritt_out_noncausal, _ = tritt_fwd(
-        q, k1, k2, v1, v2, causal=False, softmax_scale=1.0
-    )
-    print("Non-causal output shape:", tritt_out_noncausal.shape)

@@ -13,8 +13,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import traceback
 
-from trittention_triton import TrittentionTriton
-from trittention_pytorch import Trittention_pytorch
+from flash_trittention.dot_product_sum.trittention_triton import TrittentionTriton
+from flash_trittention.dot_product_sum.trittention_pytorch import Trittention_pytorch
 
 
 def get_memory_usage() -> float:

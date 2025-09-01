@@ -33,7 +33,7 @@ def get_autotune_config(short=SHORT_CONFIG):
 
 @triton.autotune(configs=get_autotune_config(), key=["HEAD_DIM", "SEQ_LEN"])
 @triton.jit
-def _tritt_bwd_dk1_dv1(
+def _tritt_bwd_dk_dv(
     Q,
     K1,
     K2,
@@ -116,19 +116,17 @@ def _tritt_bwd_dk1_dv1(
     BLOCK_SIZE_KV: tl.constexpr,
 ):
     """
-    Kernel for computing dK1, dV1, dV2, and dK2.
+    Kernel for computing dK1, dV1
     """
-    # Get program IDs (moved from outer kernel)
     batch_head_id = tl.program_id(0)  # id for batch and head
     k1_v1_block_id = tl.program_id(1)  # id for k1 and v1 (same one)
 
-    # Extract batch and head indices
     batch_id = batch_head_id // NUM_HEADS
     head_id = batch_head_id % NUM_HEADS
 
-    # Calculate k1 start position
+    # k1 is fixes, we loop over k2 and q.
     k1_start = k1_v1_block_id * BLOCK_SIZE_KV
-    # Calculate base offsets
+
     offset_q = batch_id * q_strideB + head_id * q_strideH
     offset_k1 = batch_id * k1_strideB + head_id * k1_strideH
     offset_k2 = batch_id * k2_strideB + head_id * k2_strideH
@@ -141,7 +139,6 @@ def _tritt_bwd_dk1_dv1(
     offset_dV1 = batch_id * dV1_strideB + head_id * dV1_strideH
     offset_dV2 = batch_id * dV2_strideB + head_id * dV2_strideH
 
-    # Load K1 and V1 blocks
     offs_k1 = k1_start + tl.arange(0, BLOCK_SIZE_KV)
     offs_dim = tl.arange(0, HEAD_DIM)
     mask_k1 = offs_k1 < SEQ_LEN
@@ -161,11 +158,9 @@ def _tritt_bwd_dk1_dv1(
     if convert_to_float32:
         V1_block = V1_block.to(tl.float32)
 
-    # Initialize accumulators for dK1 and dV1
     dK1_acc = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
     dV1_acc = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
 
-    # Define looping limits for k2
     if CAUSAL:
         k2_lo = k1_start
         k2_hi = tl.minimum(k1_start + k_diff + BLOCK_SIZE_KV + 1, SEQ_LEN)
@@ -173,13 +168,11 @@ def _tritt_bwd_dk1_dv1(
         k2_lo = 0
         k2_hi = SEQ_LEN
 
-    # Loop over k2
     for k2_start_loop in range(k2_lo, k2_hi, BLOCK_SIZE_KV):
         k2_start_loop = tl.multiple_of(k2_start_loop, BLOCK_SIZE_KV)
         offs_k2 = k2_start_loop + tl.arange(0, BLOCK_SIZE_KV)
         mask_k2 = offs_k2 < SEQ_LEN
 
-        # Load K2 and V2
         K2_block = tl.load(
             K2
             + offset_k2
@@ -215,13 +208,11 @@ def _tritt_bwd_dk1_dv1(
             q_lo = 0
             q_hi = SEQ_LEN
 
-        # Loop over q
         for q_start in range(q_lo, q_hi, BLOCK_SIZE_Q):
             q_start = tl.multiple_of(q_start, BLOCK_SIZE_Q)
             offs_q = q_start + tl.arange(0, BLOCK_SIZE_Q)
             mask_q = offs_q < SEQ_LEN
 
-            # Load D, M, Q and dO
             D_block = tl.load(
                 D + offset_d + offs_q * d_strideS,
                 mask=mask_q,
@@ -280,7 +271,6 @@ def _tritt_bwd_dk1_dv1(
                 maskqk = maskqk & mask_causal
             QK2_block = tl.where(maskqk, QK2_block, float("-inf"))
 
-            # PQK2 = tl.exp(QK2)
             PQK2_block = tl.exp(QK2_block)
 
             if not convert_to_float32:
@@ -294,13 +284,8 @@ def _tritt_bwd_dk1_dv1(
                 acc_QK2O += tl.dot(tl.trans(PQK2_block), dO_block)
             acc_QDK2_sub += tl.sum(PQK2_block * D_block[:, None], 0)
 
-            # dv += PQK2 * dO and sum along the q dimension
-            # acc_dv += tl.sum(
-            #    PQK2_block[:, :, None] * dO_block[:, None, :], 0
-            # )  # tl dot?
             acc_dOv1 += tl.dot(tl.trans(PQK2_block), dO_block)
 
-        # K1K2 = tl.dot(K1, K2) * softmax_scale
         if input_precision is not None:
             K1K2_block = (
                 tl.dot(K1_block, tl.trans(K2_block), input_precision=input_precision)
@@ -317,7 +302,6 @@ def _tritt_bwd_dk1_dv1(
             maskk1k2 = (maskk1k2 & mask_causal) & mask_k1_k2_k_diff
         K1K2_block = tl.where(maskk1k2, K1K2_block, float("-inf"))
 
-        # PK1K2 = tl.exp(K1K2)
         PK1K2_block = tl.exp(K1K2_block)
 
         dV1_acc += tl.sum(
@@ -400,7 +384,6 @@ def _tritt_bwd_dk1_dv1(
             mask=mask_k2[:, None] & (offs_dim[None, :] < HEAD_DIM),
         )
 
-    # Store results
     tl.store(
         dK1
         + offset_dK1
@@ -419,10 +402,8 @@ def _tritt_bwd_dk1_dv1(
         mask=(offs_k1[:, None] < SEQ_LEN) & (offs_dim[None, :] < HEAD_DIM),
     )
 
-    # dV2 and dK2 are stored inside the k2 loop using atomic_add
 
-
-def tritt_bwd_dk1_dv1(
+def tritt_bwd_dk_dv(
     Q,
     K1,
     K2,
@@ -454,10 +435,8 @@ def tritt_bwd_dk1_dv1(
     """
     BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
 
-    # Apply F.silu(V1) in the main function as instructed
     silu_V1 = F.silu(V1)
 
-    # Make tensors contiguous
     Q = Q.contiguous()
     K1 = K1.contiguous()
     K2 = K2.contiguous()
@@ -467,20 +446,16 @@ def tritt_bwd_dk1_dv1(
     dO = dO.contiguous()
     M = M.contiguous()
 
-    # Initialize output tensors
     dK1 = torch.zeros_like(K1)
     dV1 = torch.zeros_like(V1)
     dV2 = torch.zeros_like(V2)
     dK2 = torch.zeros_like(K2)
 
-    # Grid configuration
     grid = (BATCH_SIZE * NUM_HEADS, triton.cdiv(SEQ_LEN, 32))
 
-    # Block sizes
     BLOCK_SIZE_Q = 16
     BLOCK_SIZE_KV = 32
 
-    # Get strides
     q_strides = Q.stride()
     k1_strides = K1.stride()
     k2_strides = K2.stride()
@@ -494,8 +469,7 @@ def tritt_bwd_dk1_dv1(
     dV2_strides = dV2.stride()
     dK2_strides = dK2.stride()
 
-    # Launch kernel
-    _tritt_bwd_dk1_dv1[grid](
+    _tritt_bwd_dk_dv[grid](
         Q,
         K1,
         K2,

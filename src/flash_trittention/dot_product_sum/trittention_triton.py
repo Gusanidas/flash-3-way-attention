@@ -6,10 +6,10 @@ import triton
 import triton.language as tl
 
 # Import the kernels directly
-from fwd_kernel import _tritt_fwd
-from bwd_dq_kernel import _tritt_bwd_dq
-from bwd_dk1_dv1_kernel import _tritt_bwd_dk1_dv1
-from bwd_preprocess import _tritt_bwd_preprocess
+from .kernels.fwd_kernel import _tritt_fwd
+from .kernels.bwd_dq_kernel import _tritt_bwd_dq
+from .kernels.bwd_dk1_dv1_kernel import _tritt_bwd_dk_dv
+from .kernels.bwd_preprocess import _tritt_bwd_preprocess
 
 
 class TrittentionTritonFunction(torch.autograd.Function):
@@ -112,17 +112,14 @@ class TrittentionTritonFunction(torch.autograd.Function):
         q, k1, k2, v1, v2, o, m = ctx.saved_tensors
         dtype = o.dtype
 
-        # === SHAPES ===
         BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = q.shape
 
-        # === ASSERTS ===
         assert (
             grad_output.shape == o.shape
         ), f"Shape mismatch: O={o.shape}, dO={grad_output.shape}"
         assert o.device == grad_output.device, "O and dO must be on the same device"
         assert o.dtype == grad_output.dtype, "O and dO must have the same dtype"
 
-        # === DEFINE ALL EMPTY TENSORS ===
         d = torch.empty(
             (BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=o.device, dtype=o.dtype
         )
@@ -133,7 +130,6 @@ class TrittentionTritonFunction(torch.autograd.Function):
         dv2 = torch.zeros_like(v2).to(torch.float32)
         dk2_from_dk1_dv1 = torch.zeros_like(k2).to(torch.float32)
 
-        # Make tensors contiguous
         q = q.contiguous()
         k1 = k1.contiguous()
         k2 = k2.contiguous()
@@ -144,7 +140,6 @@ class TrittentionTritonFunction(torch.autograd.Function):
         m = m.contiguous()
         v1_silu = F.silu(v1)
 
-        # === GET ALL STRIDES ===
         q_strides = q.stride()
         k1_strides = k1.stride()
         k2_strides = k2.stride()
@@ -160,7 +155,6 @@ class TrittentionTritonFunction(torch.autograd.Function):
         dv1_strides = dv1.stride()
         dv2_strides = dv2.stride()
 
-        # === DEFINE BLOCK, GRID AND CALL PREPROCESSING KERNEL ===
         BLOCK_SIZE_Q_PREPROCESS = 16
         grid_preprocess = (
             triton.cdiv(SEQ_LEN, BLOCK_SIZE_Q_PREPROCESS),
@@ -171,10 +165,10 @@ class TrittentionTritonFunction(torch.autograd.Function):
             o,
             grad_output,
             d,
-            grad_output_strides[2],  # dO_stride_S
-            grad_output_strides[3],  # dO_stride_D
-            o_strides[2],  # O_stride_S
-            o_strides[3],  # O_stride_D
+            grad_output_strides[2],
+            grad_output_strides[3],
+            o_strides[2],
+            o_strides[3],
             SEQ_LEN,
             BLOCK_SIZE_Q=BLOCK_SIZE_Q_PREPROCESS,
             HEAD_DIM=HEAD_DIM,
@@ -183,7 +177,6 @@ class TrittentionTritonFunction(torch.autograd.Function):
         d = d.contiguous()
         d_strides = d.stride()
 
-        # === DEFINE BLOCK, GRID AND CALL DQ KERNEL ===
         grid_dq = lambda META: (
             triton.cdiv(SEQ_LEN, META["BLOCK_SIZE_Q"]),
             BATCH_SIZE * NUM_HEADS,
@@ -258,13 +251,12 @@ class TrittentionTritonFunction(torch.autograd.Function):
             ctx.input_precision,
         )
 
-        # === DEFINE BLOCK, GRID AND CALL DK1_DV1 KERNEL ===
         grid_dk1_dv1 = lambda META: (
             BATCH_SIZE * NUM_HEADS,
             triton.cdiv(SEQ_LEN, META["BLOCK_SIZE_KV"]),
         )
 
-        _tritt_bwd_dk1_dv1[grid_dk1_dv1](
+        _tritt_bwd_dk_dv[grid_dk1_dv1](
             q,
             k1,
             k2,
@@ -338,7 +330,7 @@ class TrittentionTritonFunction(torch.autograd.Function):
         silu_derivative = sigmoid_v1 * (1 + v1 * (1 - sigmoid_v1))
         dv1 = dv1 * silu_derivative
 
-        # Combine dk2 from both kernels
+        # Combine dk2 from both processes
         dk2 = dk2 + dk2_from_dk1_dv1
 
         dk2 = dk2.to(dtype)
@@ -393,188 +385,3 @@ class TrittentionTriton(nn.Module):
             self.convert_to_float32,
             self.input_precision,
         )
-
-
-def _call_tritt_fwd(
-    Q,
-    K1,
-    K2,
-    V1,
-    V2,
-    causal,
-    softmax_scale,
-    k_diff=2048,
-    convert_to_float32=False,
-    input_precision=None,
-):
-    """Call the forward kernel directly with proper setup."""
-    BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
-    O = torch.empty_like(Q)
-    M = torch.empty(
-        (BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=Q.device, dtype=torch.float32
-    )
-
-    grid = lambda args: (
-        triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
-        BATCH_SIZE * NUM_HEADS,
-        1,
-    )
-
-    BLOCK_SIZE_Q = 32
-    BLOCK_SIZE_KV = 64
-
-    stride_Q_batch = Q.stride(0)
-    stride_Q_head = Q.stride(1)
-    stride_Q_seq = Q.stride(2)
-    stride_Q_dim = Q.stride(3)
-
-    stride_K1_seq = K1.stride(2)
-    stride_K1_dim = K1.stride(3)
-
-    stride_K2_seq = K2.stride(2)
-    stride_K2_dim = K2.stride(3)
-
-    stride_V1_seq = V1.stride(2)
-    stride_V1_dim = V1.stride(3)
-
-    stride_V2_seq = V2.stride(2)
-    stride_V2_dim = V2.stride(3)
-
-    stride_O_seq = O.stride(2)
-    stride_O_dim = O.stride(3)
-
-    # Use STAGE=3 for causal attention, STAGE=1 for non-causal attention
-    STAGE = 3 if causal else 1
-
-    _tritt_fwd[grid](
-        Q=Q,
-        K1=K1,
-        K2=K2,
-        V1=V1,
-        V2=V2,
-        softmax_scale=softmax_scale,
-        M=M,
-        O=O,
-        stride_Q_batch=stride_Q_batch,
-        stride_Q_head=stride_Q_head,
-        stride_Q_seq=stride_Q_seq,
-        stride_Q_dim=stride_Q_dim,
-        stride_K1_seq=stride_K1_seq,
-        stride_K1_dim=stride_K1_dim,
-        stride_K2_seq=stride_K2_seq,
-        stride_K2_dim=stride_K2_dim,
-        stride_V1_seq=stride_V1_seq,
-        stride_V1_dim=stride_V1_dim,
-        stride_V2_seq=stride_V2_seq,
-        stride_V2_dim=stride_V2_dim,
-        stride_O_seq=stride_O_seq,
-        stride_O_dim=stride_O_dim,
-        NUM_HEADS=NUM_HEADS,
-        SEQ_LEN=SEQ_LEN,
-        HEAD_DIM=HEAD_DIM,
-        STAGE=STAGE,
-        k_diff=k_diff,
-        convert_to_float32=convert_to_float32,
-        input_precision=input_precision,
-    )
-
-    return O, M
-
-
-if __name__ == "__main__":
-    # Test the Triton implementation
-    device = "cuda"
-    dtype = torch.float16
-
-    # Test dimensions
-    batch_size, num_heads, seq_len, head_dim = 2, 8, 128, 64
-
-    # Create random test tensors
-    q = torch.randn(
-        batch_size,
-        num_heads,
-        seq_len,
-        head_dim,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    k1 = torch.randn(
-        batch_size,
-        num_heads,
-        seq_len,
-        head_dim,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    k2 = torch.randn(
-        batch_size,
-        num_heads,
-        seq_len,
-        head_dim,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    v1 = torch.randn(
-        batch_size,
-        num_heads,
-        seq_len,
-        head_dim,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    v2 = torch.randn(
-        batch_size,
-        num_heads,
-        seq_len,
-        head_dim,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-
-    # Test both causal and non-causal modes
-    for causal in [True, False]:
-        print(f"\nTesting {'causal' if causal else 'non-causal'} attention...")
-
-        # Create model
-        model = TrittentionTriton(causal=causal, softmax_scale=1.0, k_diff=1024)
-
-        # Forward pass
-        output = model(q, k1, k2, v1, v2)
-        print(f"Output shape: {output.shape}")
-        print(
-            f"Output mean: {output.mean().item():.6f}, std: {output.std().item():.6f}"
-        )
-
-        # Test backward pass
-        loss = output.sum()
-        loss.backward()
-
-        print(
-            f"q.grad mean: {q.grad.mean().item():.6f}, std: {q.grad.std().item():.6f}"
-        )
-        print(
-            f"k1.grad mean: {k1.grad.mean().item():.6f}, std: {k1.grad.std().item():.6f}"
-        )
-        print(
-            f"k2.grad mean: {k2.grad.mean().item():.6f}, std: {k2.grad.std().item():.6f}"
-        )
-        print(
-            f"v1.grad mean: {v1.grad.mean().item():.6f}, std: {v1.grad.std().item():.6f}"
-        )
-        print(
-            f"v2.grad mean: {v2.grad.mean().item():.6f}, std: {v2.grad.std().item():.6f}"
-        )
-
-        # Zero gradients for next test
-        q.grad = None
-        k1.grad = None
-        k2.grad = None
-        v1.grad = None
-        v2.grad = None
-
-    print("\nTriton implementation test completed!")
