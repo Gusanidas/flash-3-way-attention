@@ -1,6 +1,5 @@
 import triton
 import triton.language as tl
-import torch
 
 
 SHORT_CONFIG = True  # Set to True for faster development, False for production
@@ -60,15 +59,24 @@ def _tritt_fwd_inner(
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_KV: tl.constexpr,
 ):
+    # Round the diagonal boundary DOWN to a multiple of BLOCK_SIZE_KV so that the
+    # off-diagonal (STAGE 1) and diagonal (STAGE 2) passes tile K2 exactly once each,
+    # with no gap and no overlap, for ANY (BLOCK_SIZE_Q, BLOCK_SIZE_KV) combination.
+    # STAGE 1 handles the K2 blocks strictly below the diagonal (all k2 < q, so no
+    # q>=k2 mask needed); STAGE 2 handles the single straddling block plus everything
+    # up to the block diagonal, applying the q>=k2 mask.
+    diag_start = (block_index_q * BLOCK_SIZE_Q // BLOCK_SIZE_KV) * BLOCK_SIZE_KV
     if STAGE == 1:
-        lo, hi = 0, block_index_q * BLOCK_SIZE_Q
+        lo, hi = 0, diag_start
     elif STAGE == 2:
-        lo, hi = block_index_q * BLOCK_SIZE_Q, (block_index_q + 1) * BLOCK_SIZE_Q
+        lo, hi = diag_start, (block_index_q + 1) * BLOCK_SIZE_Q
     else:
         # Non-causal attention (process all tokens)
         lo, hi = 0, SEQ_LEN
 
     for start_kv_2 in range(lo, hi, BLOCK_SIZE_KV):
+        # lo is always a multiple of BLOCK_SIZE_KV (0, diag_start, or 0), so every
+        # start_kv_2 is too -- the alignment hint below is now always valid.
         start_kv_2 = tl.multiple_of(start_kv_2, BLOCK_SIZE_KV)
 
         lo_1_k_diff = BLOCK_SIZE_KV * (
@@ -92,9 +100,12 @@ def _tritt_fwd_inner(
         K2_block = tl.load(current_k2_block_ptr, mask=mask_k2[None, :], other=0.0)
 
         acc_k1k2_v1 = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
-        m_jk = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32)
+        # Per-COLUMN running max of the k1k2 leg (two-level online LSE). A
+        # per-block scalar max lets columns far below the block max underflow
+        # (l_jk -> 0 -> 0/0 NaN); with a per-column max every valid column keeps
+        # l_jk >= 1.
+        m_jk = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32) - 1.0e7
         l_jk = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32)
-        local_m = 0.0
 
         for start_kv_1 in range(lo_1, k1_hi, BLOCK_SIZE_KV):
             start_kv_1 = tl.multiple_of(start_kv_1, BLOCK_SIZE_KV)
@@ -137,26 +148,25 @@ def _tritt_fwd_inner(
 
             K1K2_block = K1K2_block * softmax_scale + tl.where(mask_k1_k2, 0, -1.0e7)
 
-            m_jk = tl.maximum(m_jk, tl.max(K1K2_block, axis=0))
-            m = tl.max(m_jk)
-            K1K2_block -= m
+            new_m_jk = tl.maximum(m_jk, tl.max(K1K2_block, axis=0))
+            K1K2_block -= new_m_jk[None, :]
 
             P_k1k2_block = tl.math.exp(K1K2_block)
             v1_f32 = V1_block.to(tl.float32)
             v1_f32 = v1_f32 * tl.sigmoid(v1_f32)
             V1_block = v1_f32.to(V1_block.type.element_ty)
-            alpha = tl.math.exp(local_m - m)
+            alpha = tl.math.exp(m_jk - new_m_jk)
             P_k1k2_block = P_k1k2_block.to(V1_block.type.element_ty)
             if input_precision is not None:
-                acc_k1k2_v1 = acc_k1k2_v1 * alpha + tl.dot(
+                acc_k1k2_v1 = acc_k1k2_v1 * alpha[:, None] + tl.dot(
                     tl.trans(P_k1k2_block), V1_block, input_precision=input_precision
                 )
             else:
-                acc_k1k2_v1 = acc_k1k2_v1 * alpha + tl.dot(
+                acc_k1k2_v1 = acc_k1k2_v1 * alpha[:, None] + tl.dot(
                     tl.trans(P_k1k2_block), V1_block
                 )
             l_jk = l_jk * alpha + tl.sum(P_k1k2_block, axis=0)
-            local_m = m
+            m_jk = new_m_jk
 
         current_offs_v2_seq = start_kv_2 + tl.arange(0, BLOCK_SIZE_KV)
         current_v2_block_ptr = (
@@ -168,8 +178,11 @@ def _tritt_fwd_inner(
         mask_v2 = current_offs_v2_seq < SEQ_LEN
         V2_block = tl.load(current_v2_block_ptr, mask=mask_v2[:, None], other=0.0)
 
-        o1 = acc_k1k2_v1 * V2_block * tl.math.exp(local_m)
-        l_jk = l_jk * tl.math.exp(local_m)
+        # Keep the k1k2 accumulators in per-column max-subtracted form. Instead of
+        # multiplying exp(m_jk) back in here -- which would materialise raw
+        # exp(scale*K1.K2) and overflow -- m_jk is folded additively into the OUTER
+        # softmax logit below, so the accumulators stay bounded in [0, BLOCK].
+        o1 = acc_k1k2_v1 * V2_block
 
         if input_precision is not None:
             QK2_block = tl.dot(Q_block, K2_block, input_precision=input_precision)
@@ -180,9 +193,17 @@ def _tritt_fwd_inner(
             mask_q_gt_k2 = offs_q[:, None] >= current_offs_k2_seq[None, :]
             mask_q_k2 = mask_q_k2 & mask_q_gt_k2
 
-        QK2_block = QK2_block * softmax_scale + tl.where(mask_q_k2, 0, -1.0e7)
+        # Combined outer logit = scale*Q.K2 + m_jk[t] (per-column log-scale of the
+        # k1k2 leg subtracted out of o1/l_jk). l_jk and o1 are in per-column
+        # max-subtracted form, so P_qk * l_jk and P_qk @ o1 reconstruct the exact
+        # softmax over (s, t) pairs with no column ever underflowing.
+        QK2_block = (
+            QK2_block * softmax_scale
+            + m_jk[None, :]
+            + tl.where(mask_q_k2, 0, -1.0e7)
+        )
 
-        m_ij = tl.maximum(m_i, tl.max(QK2_block + m_jk[None, :], axis=1))
+        m_ij = tl.maximum(m_i, tl.max(QK2_block, axis=1))
         QK2_block -= m_ij[:, None]
 
         P_qk = tl.math.exp(QK2_block)
@@ -352,77 +373,3 @@ def _tritt_fwd(
         tl.store(o_block_ptr, O_block.to(tl.float32), mask=mask_q[:, None])
     else:
         tl.store(o_block_ptr, O_block.to(O.type.element_ty), mask=mask_q[:, None])
-
-
-def tritt_fwd(Q, K1, K2, V1, V2, causal, softmax_scale, k_diff=2048):
-    BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
-    O = torch.empty_like(Q)
-    M = torch.empty(
-        (BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=Q.device, dtype=torch.float32
-    )
-
-    grid = lambda args: (
-        triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
-        BATCH_SIZE * NUM_HEADS,
-        1,
-    )
-
-    BLOCK_SIZE_Q = 32
-    BLOCK_SIZE_KV = 32
-
-    stride_Q_batch = Q.stride(0)
-    stride_Q_head = Q.stride(1)
-    stride_Q_seq = Q.stride(2)
-    stride_Q_dim = Q.stride(3)
-
-    stride_K1_seq = K1.stride(2)
-    stride_K1_dim = K1.stride(3)
-
-    stride_K2_seq = K2.stride(2)
-    stride_K2_dim = K2.stride(3)
-
-    stride_V1_seq = V1.stride(2)
-    stride_V1_dim = V1.stride(3)
-
-    stride_V2_seq = V2.stride(2)
-    stride_V2_dim = V2.stride(3)
-
-    stride_O_seq = O.stride(2)
-    stride_O_dim = O.stride(3)
-
-    # Use STAGE=3 for causal attention, STAGE=4 for non-causal attention
-    STAGE = 3 if causal else 1
-
-    _tritt_fwd[grid](
-        Q=Q,
-        K1=K1,
-        K2=K2,
-        V1=V1,
-        V2=V2,
-        softmax_scale=softmax_scale,
-        M=M,
-        O=O,
-        stride_Q_batch=stride_Q_batch,
-        stride_Q_head=stride_Q_head,
-        stride_Q_seq=stride_Q_seq,
-        stride_Q_dim=stride_Q_dim,
-        stride_K1_seq=stride_K1_seq,
-        stride_K1_dim=stride_K1_dim,
-        stride_K2_seq=stride_K2_seq,
-        stride_K2_dim=stride_K2_dim,
-        stride_V1_seq=stride_V1_seq,
-        stride_V1_dim=stride_V1_dim,
-        stride_V2_seq=stride_V2_seq,
-        stride_V2_dim=stride_V2_dim,
-        stride_O_seq=stride_O_seq,
-        stride_O_dim=stride_O_dim,
-        BLOCK_SIZE_Q=BLOCK_SIZE_Q,
-        BLOCK_SIZE_KV=BLOCK_SIZE_KV,
-        NUM_HEADS=NUM_HEADS,
-        SEQ_LEN=SEQ_LEN,
-        HEAD_DIM=HEAD_DIM,
-        STAGE=STAGE,
-        k_diff=k_diff,
-    )
-
-    return O, M

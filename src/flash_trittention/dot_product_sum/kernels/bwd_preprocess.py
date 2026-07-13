@@ -1,6 +1,5 @@
 import triton
 import triton.language as tl
-import torch
 
 
 @triton.jit
@@ -48,57 +47,3 @@ def _tritt_bwd_preprocess(
 
     d_ptrs = D + head_idx * SEQ_LEN + offs_q
     tl.store(d_ptrs, delta, mask=mask)
-
-
-def tritt_bwd_preprocess(O: torch.Tensor, dO: torch.Tensor) -> torch.Tensor:
-    """
-    PyTorch wrapper for the backward preprocessing kernel.
-
-    Computes D = sum(O * dO) along the head dimension for each sequence position.
-    """
-    batch_size, num_heads, seq_len, head_dim = O.shape
-
-    assert dO.shape == O.shape, f"Shape mismatch: O={O.shape}, dO={dO.shape}"
-    assert O.device == dO.device, "O and dO must be on the same device"
-    assert O.dtype == dO.dtype, "O and dO must have the same dtype"
-
-    D = torch.empty((batch_size, num_heads, seq_len), device=O.device, dtype=O.dtype)
-
-    BLOCK_SIZE_Q = 16  # Block size for sequence dimension
-
-    grid = (triton.cdiv(seq_len, BLOCK_SIZE_Q), batch_size * num_heads)
-
-    O_stride_S = O.stride(2)
-    O_stride_D = O.stride(3)
-    dO_stride_S = dO.stride(2)
-    dO_stride_D = dO.stride(3)
-
-    _tritt_bwd_preprocess[grid](
-        O,
-        dO,
-        D,
-        dO_stride_S,
-        dO_stride_D,
-        O_stride_S,
-        O_stride_D,
-        seq_len,
-        BLOCK_SIZE_Q=BLOCK_SIZE_Q,
-        HEAD_DIM=head_dim,
-    )
-
-    return D
-
-
-def pytorch_bwd_preprocess(O: torch.Tensor, dO: torch.Tensor) -> torch.Tensor:
-    """
-    Pure PyTorch implementation of the backward preprocessing.
-
-    Computes D = sum(O * dO) along the head dimension for each sequence position.
-    This is equivalent to the Triton kernel but uses PyTorch operations.
-    """
-    assert dO.shape == O.shape, f"Shape mismatch: O={O.shape}, dO={dO.shape}"
-    assert O.device == dO.device, "O and dO must be on the same device"
-    assert O.dtype == dO.dtype, "O and dO must have the same dtype"
-
-    D = torch.sum(O * dO, dim=-1)
-    return D

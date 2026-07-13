@@ -1,54 +1,7 @@
 import triton
 import triton.language as tl
-import torch
-import torch.nn.functional as F
-from .utils import process_masking_variables
 from .intervals import interval_k1, interval_k2_from_q
-
-SHORT_CONFIG = True  # Set to True for faster development, False for production
-
-
-def get_autotune_config(short=SHORT_CONFIG):
-    if short:
-        return [
-            triton.Config(
-                {"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=3, num_warps=8
-            )
-            for bq in [16]
-            for bkv in [16]
-        ]
-    else:
-        return [
-            triton.Config(
-                {"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=ns, num_warps=nw
-            )
-            for bq in [16, 32, 64, 128]
-            for bkv in [16, 32, 64, 128]
-            for ns in [1, 2, 3]
-            for nw in [1, 2, 4, 8]
-        ]
-
-
-@triton.jit
-def _get_mask(
-    kk_left,
-    kk_right,
-    k1_window,
-    k2_window,
-    offs_q,
-    offs_kv1,
-    offs_kv2,
-):
-    qk1_mask = (offs_q[:, None] <= offs_kv1[None, :] + k1_window) & (
-        offs_q[:, None] >= offs_kv1[None, :]
-    )
-    qk2_mask = (offs_q[:, None] <= offs_kv2[None, :] + k2_window) & (
-        offs_q[:, None] >= offs_kv2[None, :]
-    )
-    kk_mask = (offs_kv1[None, :] + kk_left >= offs_kv2[:, None]) & (
-        offs_kv2[:, None] + kk_right >= offs_kv1[None, :]
-    )
-    return qk1_mask[:, None, :] & qk2_mask[:, :, None] & kk_mask[None, :, :]
+from .utils import get_autotune_config, get_causal_mask
 
 
 @triton.autotune(configs=get_autotune_config(), key=["HEAD_DIM", "SEQ_LEN"])
@@ -216,7 +169,7 @@ def _tritt_fwd(
                 & mask_kv1[None, None, :]
             )
             if causal:
-                mask_qjk = mask_qjk & _get_mask(
+                mask_qjk = mask_qjk & get_causal_mask(
                     kk_left=kk_left,
                     kk_right=kk_right,
                     k1_window=k1_window,
@@ -234,7 +187,6 @@ def _tritt_fwd(
             P_m = P - new_m[:, None]
             exp_P = tl.exp(P_m)
             l_qjk = tl.sum(exp_P, axis=1)
-            new_m = new_m
 
             v1_block_ptr = (
                 V1
@@ -271,98 +223,3 @@ def _tritt_fwd(
     tl.store(l_ptrs, l_i, mask=l_mask)
 
     tl.store(o_block_ptr, O_block, mask=mask_q[:, None] & mask_head_dim[None, :])
-
-
-def tritt_fwd(
-    Q,
-    K1,
-    K2,
-    V1,
-    V2,
-    softmax_scale,
-    kk_left,
-    kk_right,
-    k1_window,
-    k2_window,
-    causal,
-    convert_to_float32,
-):
-    (
-        BATCH_SIZE,
-        NUM_HEADS,
-        SEQ_LEN,
-        HEAD_DIM,
-    ) = Q.shape
-    HEAD_DIM_pow2 = triton.next_power_of_2(HEAD_DIM)
-    O = torch.zeros(
-        (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM),
-        dtype=Q.dtype,
-        device=Q.device,
-    )
-    M = torch.zeros(
-        (BATCH_SIZE, NUM_HEADS, SEQ_LEN),
-        dtype=torch.float32,
-        device=Q.device,
-    )
-    L = torch.zeros(
-        (BATCH_SIZE, NUM_HEADS, SEQ_LEN),
-        dtype=torch.float32,
-        device=Q.device,
-    )
-    grid = lambda meta: (
-        triton.cdiv(SEQ_LEN, meta["BLOCK_SIZE_Q"]),
-        BATCH_SIZE * NUM_HEADS,
-    )
-    V1 = F.silu(V1)
-
-    Q = Q.contiguous()
-    K1 = K1.contiguous()
-    K2 = K2.contiguous()
-    V1 = V1.contiguous()
-    V2 = V2.contiguous()
-    O = O.contiguous()
-    M = M.contiguous()
-    L = L.contiguous()
-
-    k1_window, k2_window, kk_left, kk_right = process_masking_variables(
-        SEQ_LEN, k1_window, k2_window, kk_left, kk_right
-    )
-
-    sqrt_softmax_scale = softmax_scale**0.5
-
-    _tritt_fwd[grid](
-        Q=Q,
-        K1=K1,
-        K2=K2,
-        V1=V1,
-        V2=V2,
-        softmax_scale=sqrt_softmax_scale,
-        M=M,
-        L=L,
-        O=O,
-        stride_Q_batch=Q.stride(0),
-        stride_Q_head=Q.stride(1),
-        stride_Q_seq=Q.stride(2),
-        stride_Q_dim=Q.stride(3),
-        stride_K1_seq=K1.stride(2),
-        stride_K1_dim=K1.stride(3),
-        stride_K2_seq=K2.stride(2),
-        stride_K2_dim=K2.stride(3),
-        stride_V1_seq=V1.stride(2),
-        stride_V1_dim=V1.stride(3),
-        stride_V2_seq=V2.stride(2),
-        stride_V2_dim=V2.stride(3),
-        stride_O_seq=O.stride(2),
-        stride_O_dim=O.stride(3),
-        NUM_HEADS=NUM_HEADS,
-        SEQ_LEN=SEQ_LEN,
-        HEAD_DIM=HEAD_DIM,
-        HEAD_DIM_pow2=HEAD_DIM_pow2,
-        kk_left=kk_left,
-        kk_right=kk_right,
-        k1_window=k1_window,
-        k2_window=k2_window,
-        causal=causal,
-        convert_to_float32=convert_to_float32,
-    )
-    return O, M, L

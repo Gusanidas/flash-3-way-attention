@@ -1,13 +1,7 @@
 import triton
 import triton.language as tl
-import torch
-import torch.nn.functional as F
-from .utils import process_masking_variables
 from .intervals import interval_k1_from_k2, intervals_q
-from .utils import (
-    get_autotune_config,
-    get_causal_mask,
-)
+from .utils import get_autotune_config, get_causal_mask
 
 
 @triton.autotune(configs=get_autotune_config(short=True), key=["HEAD_DIM", "SEQ_LEN"])
@@ -19,7 +13,6 @@ def _tritt_bwd_dv2(
     V1,
     V2,
     dO,
-    D,
     M,
     dv2,
     softmax_scale,
@@ -152,8 +145,6 @@ def _tritt_bwd_dv2(
         )
 
         for start_q in range(lo_q, hi_q, BLOCK_SIZE_Q):
-            start_q = tl.multiple_of(start_q, BLOCK_SIZE_Q)
-
             offs_q = start_q + tl.arange(0, BLOCK_SIZE_Q)
             mask_q = offs_q < SEQ_LEN
 
@@ -172,7 +163,7 @@ def _tritt_bwd_dv2(
 
             offset = offs_q
             m_mask = offs_q < SEQ_LEN
-            m_i = tl.load(M + offset, mask=m_mask, other=-masking_value)
+            m_i = tl.load(M + offset, mask=m_mask, other=float("inf"))
 
             dO_block_ptr = (
                 dO
@@ -234,94 +225,3 @@ def _tritt_bwd_dv2(
         + kv2_seq_offs[None, :] * stride_dv2_seq
     )
     tl.store(dv2_block_ptr, dv2_block, mask=mask_kv2[None, :] & mask_head_dim[:, None])
-
-
-def tritt_bwd_dv2(
-    Q,
-    K1,
-    K2,
-    V1,
-    V2,
-    dO,
-    O,
-    M,
-    causal,
-    softmax_scale,
-    seq_len,
-    batch_size,
-    num_heads,
-    head_dim,
-    k1_window,
-    k2_window,
-    kk_left,
-    kk_right,
-):
-    Q = Q.contiguous()
-    K1 = K1.contiguous()
-    K2 = K2.contiguous()
-    V1 = V1.contiguous()
-    V2 = V2.contiguous()
-    dO = dO.contiguous()
-    O = O.contiguous()
-    M = M.contiguous()
-
-    V1 = F.silu(V1)
-
-    dv2 = torch.zeros_like(V2)
-
-    D = torch.sum(dO * O, dim=-1)
-
-    HEAD_DIM_pow2 = triton.next_power_of_2(head_dim)
-
-    grid = lambda meta: (
-        triton.cdiv(seq_len, meta["BLOCK_SIZE_KV"]),
-        batch_size * num_heads,
-    )
-
-    k1_window, k2_window, kk_left, kk_right = process_masking_variables(
-        seq_len, k1_window, k2_window, kk_left, kk_right
-    )
-
-    convert_to_float32 = True
-    masking_value = 1e-4 if Q.dtype == torch.float32 else 1e-2
-
-    _tritt_bwd_dv2[grid](
-        Q=Q,
-        K1=K1,
-        K2=K2,
-        V1=V1,
-        V2=V2,
-        dO=dO,
-        D=D,
-        M=M,
-        dv2=dv2,
-        softmax_scale=softmax_scale**0.5,
-        stride_Q_batch=Q.stride(0),
-        stride_Q_head=Q.stride(1),
-        stride_Q_seq=Q.stride(2),
-        stride_Q_dim=Q.stride(3),
-        stride_K1_seq=K1.stride(2),
-        stride_K1_dim=K1.stride(3),
-        stride_K2_seq=K2.stride(2),
-        stride_K2_dim=K2.stride(3),
-        stride_V1_seq=V1.stride(2),
-        stride_V1_dim=V1.stride(3),
-        stride_V2_seq=V2.stride(2),
-        stride_V2_dim=V2.stride(3),
-        stride_dO_seq=dO.stride(2),
-        stride_dO_dim=dO.stride(3),
-        stride_dv2_seq=dv2.stride(2),
-        stride_dv2_dim=dv2.stride(3),
-        NUM_HEADS=num_heads,
-        SEQ_LEN=seq_len,
-        HEAD_DIM=head_dim,
-        HEAD_DIM_pow2=HEAD_DIM_pow2,
-        kk_left=kk_left,
-        kk_right=kk_right,
-        k1_window=k1_window,
-        k2_window=k2_window,
-        causal=causal,
-        convert_to_float32=convert_to_float32,
-        masking_value=masking_value,
-    )
-    return dv2

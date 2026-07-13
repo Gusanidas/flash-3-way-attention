@@ -1,10 +1,5 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import einops
 import triton
 import triton.language as tl
-import numpy as np
 
 
 SHORT_CONFIG = True  # Set to True for faster development, False for production
@@ -195,10 +190,38 @@ def _tritt_bwd_dk_dv(
         if convert_to_float32:
             V2_block = V2_block.to(tl.float32)
 
+        # Recompute the k1k2 leg BEFORE the q-loop so we can derive a per-block max
+        # (mk) that stabilizes exp(scale*K1.K2). mk is folded additively into the QK2
+        # logit inside the q-loop and subtracted from the K1K2 logit here, so the
+        # reconstructed probability PQK2 * PK1K2 = exp(scale*(Q.K2 + K1.K2) - M) is
+        # unchanged (mk cancels) while neither factor overflows -- matching the
+        # forward's convention where M = log(sum over (s,t) exp(scale*(Q.K2+K1.K2))).
+        if input_precision is not None:
+            K1K2_block = (
+                tl.dot(K1_block, tl.trans(K2_block), input_precision=input_precision)
+                * softmax_scale
+            )
+        else:
+            K1K2_block = tl.dot(K1_block, tl.trans(K2_block)) * softmax_scale
+
+        maskk1k2 = mask_k1[:, None] & mask_k2[None, :]
+        if CAUSAL:
+            mask_causal = offs_k1[:, None] <= offs_k2[None, :]
+            mask_k1_k2_k_diff = offs_k1[:, None] + k_diff >= offs_k2[None, :]
+            maskk1k2 = (maskk1k2 & mask_causal) & mask_k1_k2_k_diff
+
+        # Per-COLUMN (k2) max for stabilization. Masked entries use a large finite
+        # negative in the max (so a fully-masked column still yields a finite mk),
+        # but -inf in the exponent (so masked entries give exactly 0). Per-column
+        # (not per-block scalar) keeps every valid column's PK1K2 max at 1, so no
+        # column can underflow, and M >= scale*Q.K2 + mk[t] bounds PQK2 <= 1.
+        mk = tl.max(tl.where(maskk1k2, K1K2_block, -1.0e9), axis=0)
+        K1K2_block = tl.where(maskk1k2, K1K2_block, float("-inf"))
+        PK1K2_block = tl.exp(K1K2_block - mk[None, :])
+
         acc_QK2O = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
         # For the term that will be subtracted.
         acc_QDK2_sub = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32)
-        acc_dOv1 = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
 
         # Define looping limits for q
         if CAUSAL:
@@ -251,24 +274,31 @@ def _tritt_bwd_dk_dv(
             if convert_to_float32:
                 dO_block = dO_block.to(tl.float32)
 
-            # QK2 = tl.dot(Q, K2) * softmax_scale - M
+            # QK2 = tl.dot(Q, K2) * softmax_scale - M + mk
+            # The + mk folds in the k1k2-leg block max; it cancels against the -mk on
+            # PK1K2 above, keeping PQK2 * PK1K2 exact while both factors stay bounded.
             if input_precision is not None:
                 QK2_block = (
                     tl.dot(Q_block, tl.trans(K2_block), input_precision=input_precision)
                     * softmax_scale
                     - M_block[:, None]
+                    + mk[None, :]
                 )
             else:
                 QK2_block = (
                     tl.dot(Q_block, tl.trans(K2_block)) * softmax_scale
                     - M_block[:, None]
+                    + mk[None, :]
                 )
 
             # Do necessary masking if causal
             maskqk = mask_q[:, None] & mask_k2[None, :]
             if CAUSAL:
-                mask_causal = offs_q[:, None] >= offs_k2[None, :]
-                maskqk = maskqk & mask_causal
+                # distinct name from the (k1, k2)-shaped mask_causal above: reusing
+                # the name makes Triton treat it as a loop-carried variable whose
+                # shape changes (compile error)
+                mask_causal_qk = offs_q[:, None] >= offs_k2[None, :]
+                maskqk = maskqk & mask_causal_qk
             QK2_block = tl.where(maskqk, QK2_block, float("-inf"))
 
             PQK2_block = tl.exp(QK2_block)
@@ -284,29 +314,12 @@ def _tritt_bwd_dk_dv(
                 acc_QK2O += tl.dot(tl.trans(PQK2_block), dO_block)
             acc_QDK2_sub += tl.sum(PQK2_block * D_block[:, None], 0)
 
-            acc_dOv1 += tl.dot(tl.trans(PQK2_block), dO_block)
-
-        if input_precision is not None:
-            K1K2_block = (
-                tl.dot(K1_block, tl.trans(K2_block), input_precision=input_precision)
-                * softmax_scale
-            )
-        else:
-            K1K2_block = tl.dot(K1_block, tl.trans(K2_block)) * softmax_scale
-
-        # Do necessary masking if causal
-        maskk1k2 = mask_k1[:, None] & mask_k2[None, :]
-        if CAUSAL:
-            mask_causal = offs_k1[:, None] <= offs_k2[None, :]
-            mask_k1_k2_k_diff = offs_k1[:, None] + k_diff >= offs_k2[None, :]
-            maskk1k2 = (maskk1k2 & mask_causal) & mask_k1_k2_k_diff
-        K1K2_block = tl.where(maskk1k2, K1K2_block, float("-inf"))
-
-        PK1K2_block = tl.exp(K1K2_block)
-
+        # K1K2_block / PK1K2_block / mk were computed once above the q-loop.
+        # acc_QK2O = sum_q trans(PQK2) @ dO is exactly the (formerly duplicated)
+        # dO-weighted-by-PQK2 term used for both dV1 and dV2.
         dV1_acc += tl.sum(
             PK1K2_block[:, :, None]
-            * acc_dOv1[None, :, :]
+            * acc_QK2O[None, :, :]
             * tl.trans(V2_block)[None, :, :],
             1,
         )
@@ -314,7 +327,7 @@ def _tritt_bwd_dk_dv(
         # Compute dV2 contribution for this k2 block
         dV2_contrib = tl.sum(
             PK1K2_block[:, :, None]
-            * acc_dOv1[None, :, :]
+            * acc_QK2O[None, :, :]
             * tl.trans(V1_block)[:, None, :],
             0,
         )
@@ -401,146 +414,3 @@ def _tritt_bwd_dk_dv(
         dV1_acc,
         mask=(offs_k1[:, None] < SEQ_LEN) & (offs_dim[None, :] < HEAD_DIM),
     )
-
-
-def tritt_bwd_dk_dv(
-    Q,
-    K1,
-    K2,
-    V1,
-    V2,
-    D,
-    softmax_scale,
-    dO,
-    M,
-    causal,
-    k_diff=2048,
-    convert_to_float32=False,
-    input_precision=None,
-):
-    """
-    Wrapper function for backward dK1, dV1, dV2, and dK2 computation.
-
-    Args:
-        Q, K1, K2, V1, V2: Input tensors
-        D: Preprocessing result from forward pass
-        softmax_scale: Scaling factor for attention
-        dO: Gradient of output
-        M: Logits normalization from forward pass
-        causal: Whether to use causal masking
-        k_diff: Maximum distance for k-masking
-
-    Returns:
-        dK1, dV1, dV2, dK2: Gradients w.r.t. K1, V1, V2, and K2
-    """
-    BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
-
-    silu_V1 = F.silu(V1)
-
-    Q = Q.contiguous()
-    K1 = K1.contiguous()
-    K2 = K2.contiguous()
-    V1 = V1.contiguous()
-    V2 = V2.contiguous()
-    D = D.contiguous()
-    dO = dO.contiguous()
-    M = M.contiguous()
-
-    dK1 = torch.zeros_like(K1)
-    dV1 = torch.zeros_like(V1)
-    dV2 = torch.zeros_like(V2)
-    dK2 = torch.zeros_like(K2)
-
-    grid = (BATCH_SIZE * NUM_HEADS, triton.cdiv(SEQ_LEN, 32))
-
-    BLOCK_SIZE_Q = 16
-    BLOCK_SIZE_KV = 32
-
-    q_strides = Q.stride()
-    k1_strides = K1.stride()
-    k2_strides = K2.stride()
-    v1_strides = V1.stride()
-    v2_strides = V2.stride()
-    d_strides = D.stride()
-    dO_strides = dO.stride()
-    m_strides = M.stride()
-    dK1_strides = dK1.stride()
-    dV1_strides = dV1.stride()
-    dV2_strides = dV2.stride()
-    dK2_strides = dK2.stride()
-
-    _tritt_bwd_dk_dv[grid](
-        Q,
-        K1,
-        K2,
-        silu_V1,
-        V2,
-        D,
-        softmax_scale,
-        dO,
-        M,
-        dK1,
-        dV1,
-        dV2,
-        dK2,
-        q_strides[0],
-        q_strides[1],
-        q_strides[2],
-        q_strides[3],
-        k1_strides[0],
-        k1_strides[1],
-        k1_strides[2],
-        k1_strides[3],
-        k2_strides[0],
-        k2_strides[1],
-        k2_strides[2],
-        k2_strides[3],
-        v1_strides[0],
-        v1_strides[1],
-        v1_strides[2],
-        v1_strides[3],
-        v2_strides[0],
-        v2_strides[1],
-        v2_strides[2],
-        v2_strides[3],
-        d_strides[0],
-        d_strides[1],
-        d_strides[2],
-        dO_strides[0],
-        dO_strides[1],
-        dO_strides[2],
-        dO_strides[3],
-        m_strides[0],
-        m_strides[1],
-        m_strides[2],
-        dK1_strides[0],
-        dK1_strides[1],
-        dK1_strides[2],
-        dK1_strides[3],
-        dV1_strides[0],
-        dV1_strides[1],
-        dV1_strides[2],
-        dV1_strides[3],
-        dV2_strides[0],
-        dV2_strides[1],
-        dV2_strides[2],
-        dV2_strides[3],
-        dK2_strides[0],
-        dK2_strides[1],
-        dK2_strides[2],
-        dK2_strides[3],
-        SEQ_LEN,
-        BLOCK_SIZE_Q,
-        BLOCK_SIZE_KV,
-        HEAD_DIM,
-        NUM_HEADS,
-        causal,
-        k_diff,
-        convert_to_float32,
-        input_precision,
-    )
-    sigmoid_v1 = torch.sigmoid(V1)
-    silu_derivative = sigmoid_v1 * (1 + V1 * (1 - sigmoid_v1))
-    dV1 = dV1 * silu_derivative
-
-    return dK1, dV1, dV2, dK2

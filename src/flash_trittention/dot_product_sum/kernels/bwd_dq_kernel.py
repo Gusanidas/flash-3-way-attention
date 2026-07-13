@@ -1,5 +1,3 @@
-import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -168,10 +166,11 @@ def _tritt_bwd_dq(
         D_block = D_block.to(tl.float32)
 
     # M => shape [BLOCK_Q]; M is [B, N, S]
-    m_q = tl.load(M + (offset_m + offs_q * M_strideS), mask=offs_q < SEQ_LEN, other=0.0)
+    m_q = tl.load(
+        M + (offset_m + offs_q * M_strideS), mask=offs_q < SEQ_LEN, other=-1.0e9
+    )
     if convert_to_float32:
         m_q = m_q.to(tl.float32)
-    avg_m = tl.max(m_q)
 
     # Loop over K1 in blocks
     for start_kv_2 in range(lo, hi, BLOCK_SIZE_KV):
@@ -201,6 +200,11 @@ def _tritt_bwd_dq(
 
         acc_k1k2_v1 = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
         acc_pk2_k1 = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32)
+        # Per-column (k2) running max of the k1k2 leg. It is subtracted from the
+        # k1k2 exponent here and added back into the QK2 exponent below, so it
+        # cancels exactly while keeping both exp factors <= 1 (M >= scale*Q.K2 +
+        # mk[t] for every valid (q, t)).
+        mk = tl.zeros([BLOCK_SIZE_KV], dtype=tl.float32) - 1.0e9
 
         for start_kv_1 in range(lo_1, k1_hi, BLOCK_SIZE_KV):
             start_kv_1 = tl.multiple_of(start_kv_1, BLOCK_SIZE_KV)
@@ -249,18 +253,25 @@ def _tritt_bwd_dq(
                 mask_k1_lt_k2 = mask_k1_lt_k2 & mask_k1_k2_k_diff
                 mask_k1_k2 = mask_k1_k2 & mask_k1_lt_k2
 
-            K1K2_block = K1K2_block * softmax_scale - 0.5 * avg_m
+            K1K2_block = K1K2_block * softmax_scale
 
+            new_mk = tl.maximum(
+                mk, tl.max(tl.where(mask_k1_k2, K1K2_block, -1.0e9), axis=0)
+            )
             K1K2_block = tl.where(mask_k1_k2, K1K2_block, float("-inf"))
-            P_k1k2_block = tl.math.exp(K1K2_block)
+            P_k1k2_block = tl.math.exp(K1K2_block - new_mk[None, :])
+            alpha_k = tl.math.exp(mk - new_mk)
             P_k1k2_block = P_k1k2_block.to(dO_block.dtype)
             if input_precision is not None:
-                acc_k1k2_v1 += tl.trans(
+                acc_k1k2_v1 = acc_k1k2_v1 * alpha_k[:, None] + tl.trans(
                     tl.dot(V1_block, P_k1k2_block, input_precision=input_precision)
                 )
             else:
-                acc_k1k2_v1 += tl.trans(tl.dot(V1_block, P_k1k2_block))
-            acc_pk2_k1 += tl.sum(P_k1k2_block, 0)
+                acc_k1k2_v1 = acc_k1k2_v1 * alpha_k[:, None] + tl.trans(
+                    tl.dot(V1_block, P_k1k2_block)
+                )
+            acc_pk2_k1 = acc_pk2_k1 * alpha_k + tl.sum(P_k1k2_block, 0)
+            mk = new_mk
 
         if input_precision is not None:
             QK2_block = tl.dot(Q_block, K2_block, input_precision=input_precision)
@@ -271,7 +282,7 @@ def _tritt_bwd_dq(
             mask_q_gt_k2 = offs_q[:, None] >= current_offs_k2_seq[None, :]
             mask_q_k2 = mask_q_k2 & mask_q_gt_k2
 
-        QK2_block = QK2_block * softmax_scale - m_q[:, None]
+        QK2_block = QK2_block * softmax_scale - m_q[:, None] + mk[None, :]
         QK2_block = tl.where(mask_q_k2, QK2_block, float("-inf"))
         P_qk2 = tl.math.exp(QK2_block)
         # P_qk = P_qk * tl.where(mask_q_k2, 1, 0)
@@ -299,7 +310,6 @@ def _tritt_bwd_dq(
         dS_right = P_qk2 * D_block[:, None] * acc_pk2_k1[None, :]
 
         dS = dS_left - dS_right
-        dS = dS * tl.exp(0.5 * (avg_m))
         if not convert_to_float32:
             dS = dS.to(K2_block.dtype)
         if input_precision is not None:
@@ -338,141 +348,3 @@ def _tritt_bwd_dq(
         dQ_block,
         mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < HEAD_DIM),
     )
-
-
-def tritt_bwd_dq(
-    Q,
-    K1,
-    K2,
-    V1,
-    V2,
-    D,
-    softmax_scale,
-    dO,
-    M,
-    causal,
-    k_diff=2048,
-    convert_to_float32=False,
-    input_precision=None,
-):
-    """
-    Wrapper function for backward dQ and dK2 computation.
-
-    Args:
-        Q, K1, K2, V1, V2: Input tensors
-        D: Preprocessing result from forward pass
-        softmax_scale: Scaling factor for attention
-        dO: Gradient of output
-        M: Logits normalization from forward pass
-        causal: Whether to use causal masking
-        k_diff: Maximum distance for k-masking
-
-    Returns:
-        dQ: Gradient w.r.t. Q
-        dK2: Gradient w.r.t. K2
-    """
-    BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
-    dQ = torch.zeros_like(Q)
-    dK2 = torch.zeros_like(K2)
-    V1 = F.silu(V1)
-    V1 = V1.contiguous()
-    V2 = V2.contiguous()
-    Q = Q.contiguous()
-    K1 = K1.contiguous()
-    K2 = K2.contiguous()
-    D = D.contiguous()
-    M = M.contiguous()
-    dO = dO.contiguous()
-    dQ = dQ.contiguous()
-    dK2 = dK2.contiguous()
-
-    # Grid configuration
-
-    # Block sizes
-    BLOCK_SIZE_Q = 32
-    BLOCK_SIZE_KV = 32
-    grid = lambda META: (triton.cdiv(SEQ_LEN, BLOCK_SIZE_Q), BATCH_SIZE * NUM_HEADS)
-
-    # Compute strides
-    q_strides = Q.stride()
-    k1_strides = K1.stride()
-    k2_strides = K2.stride()
-    v1_strides = V1.stride()
-    v2_strides = V2.stride()
-    do_strides = dO.stride()
-    d_strides = D.stride()
-    m_strides = M.stride()
-    dq_strides = dQ.stride()
-    dk2_strides = dK2.stride()
-
-    # Call the unified kernel
-    _tritt_bwd_dq[grid](
-        Q,
-        K1,
-        K2,
-        V1,
-        V2,
-        D,
-        softmax_scale,
-        dO,
-        dQ,
-        dK2,
-        M,
-        # Q strides
-        q_strides[0],
-        q_strides[1],
-        q_strides[2],
-        q_strides[3],
-        # K1 strides
-        k1_strides[0],
-        k1_strides[1],
-        k1_strides[2],
-        k1_strides[3],
-        # K2 strides
-        k2_strides[0],
-        k2_strides[1],
-        k2_strides[2],
-        k2_strides[3],
-        # V1 strides
-        v1_strides[0],
-        v1_strides[1],
-        v1_strides[2],
-        v1_strides[3],
-        # V2 strides
-        v2_strides[0],
-        v2_strides[1],
-        v2_strides[2],
-        v2_strides[3],
-        # D strides
-        d_strides[0],
-        d_strides[1],
-        d_strides[2],
-        # dO strides
-        do_strides[0],
-        do_strides[1],
-        do_strides[2],
-        do_strides[3],
-        # dQ strides
-        dq_strides[0],
-        dq_strides[1],
-        dq_strides[2],
-        dq_strides[3],
-        # dK2 strides
-        dk2_strides[0],
-        dk2_strides[1],
-        dk2_strides[2],
-        dk2_strides[3],
-        # M strides
-        m_strides[0],
-        m_strides[1],
-        m_strides[2],
-        SEQ_LEN,
-        HEAD_DIM,
-        NUM_HEADS,
-        causal,
-        k_diff,
-        convert_to_float32,
-        input_precision,
-    )
-
-    return dQ, dK2

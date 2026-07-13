@@ -55,14 +55,6 @@ def interval_k2_from_k1(
     if not causal:
         return 0, seq_len
 
-    if k1_window is None:
-        k1_window = seq_len
-
-    if kk_left is None:
-        kk_left = seq_len
-    if kk_right is None:
-        kk_right = seq_len
-
     start = start_k1 - kk_right
     start = align_to_block(start, block_k)
     start = tl.maximum(start, 0)
@@ -86,19 +78,13 @@ def interval_k1_from_k2(
     if not causal:
         return 0, seq_len
 
-    if k2_window is None:
-        k2_window = seq_len
-    if kk_left is None:
-        kk_left = seq_len
-    if kk_right is None:
-        kk_right = seq_len
-
     start = start_k2 - kk_left
     start = align_to_block(start, block_k)
     start = tl.maximum(start, 0)
     end = start_k2 + block_k + kk_right
     end_k2 = start_k2 + block_k + k2_window
     end = tl.minimum(end, end_k2)
+    end = tl.minimum(end, seq_len)
 
     return start, end
 
@@ -166,7 +152,7 @@ def intervals_q(
     # Lower bound is the max of start_k1 and start_k2
     start = tl.maximum(start_k1, start_k2)
 
-    # Upper bound is the max of:
+    # Upper bound is the min of:
     # - start_k1 + block_k + k1_window
     # - start_k2 + block_k + k2_window
     end1 = start_k1 + block_k + k1_window

@@ -9,12 +9,13 @@ description = "Efficient attention mechanisms with multiple implementations"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Gusanidas", email = "alejandrogus792@gmail.com"}
 ]
 dependencies = [
     "torch",
     "triton",
-    "numpy"
+    "numpy",
+    "einops"
 ]
 
 [project.optional-dependencies]
@@ -26,11 +27,18 @@ dev = [
     "mypy"
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-dir]
-"" = "src"
+[tool.setuptools]
+packages = [
+    "flash_trittention",
+    "flash_trittention.common",
+    "flash_trittention.dot_product_sum",
+    "flash_trittention.dot_product_sum.kernels",
+    "flash_trittention.triple_dot_product",
+    "flash_trittention.triple_dot_product.kernels",
+    "b200",
+    "h100",
+]
+package-dir = {"" = "src", "b200" = "b200", "h100" = "h100"}
 
 [tool.black]
 line-length = 88

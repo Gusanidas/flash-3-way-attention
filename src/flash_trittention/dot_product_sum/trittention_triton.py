@@ -27,8 +27,25 @@ class TrittentionTritonFunction(torch.autograd.Function):
         convert_to_float32=False,
         input_precision=None,
     ):
-        # Save tensors and parameters for backward pass
-        ctx.save_for_backward(q, k1, k2, v1, v2)
+        # The forward kernel offsets K1/K2/V1/V2 with Q's batch/head strides, so all
+        # five inputs must share Q's layout. Enforce identical shape/dtype/device and
+        # make them contiguous (matching what backward already does).
+        if not (q.shape == k1.shape == k2.shape == v1.shape == v2.shape):
+            raise ValueError(
+                f"Shape mismatch: q={q.shape}, k1={k1.shape}, k2={k2.shape}, "
+                f"v1={v1.shape}, v2={v2.shape}"
+            )
+        if not (q.dtype == k1.dtype == k2.dtype == v1.dtype == v2.dtype):
+            raise ValueError("q, k1, k2, v1, v2 must all have the same dtype")
+        if not (q.device == k1.device == k2.device == v1.device == v2.device):
+            raise ValueError("q, k1, k2, v1, v2 must all be on the same device")
+
+        q = q.contiguous()
+        k1 = k1.contiguous()
+        k2 = k2.contiguous()
+        v1 = v1.contiguous()
+        v2 = v2.contiguous()
+
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
         ctx.k_diff = k_diff
@@ -120,8 +137,10 @@ class TrittentionTritonFunction(torch.autograd.Function):
         assert o.device == grad_output.device, "O and dO must be on the same device"
         assert o.dtype == grad_output.dtype, "O and dO must have the same dtype"
 
+        # D = sum(O * dO) is a reduction that must accumulate in fp32 regardless of
+        # the input dtype; the bwd kernels load it as fp32.
         d = torch.empty(
-            (BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=o.device, dtype=o.dtype
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=o.device, dtype=torch.float32
         )
         dq = torch.zeros_like(q)
         dk1 = torch.zeros_like(k1)
@@ -337,9 +356,6 @@ class TrittentionTritonFunction(torch.autograd.Function):
         dv2 = dv2.to(dtype)
 
         # === RETURN THE OUTPUT ===
-        print(
-            f"Return dq: {dq.shape}, dk1: {dk1.shape}, dk2: {dk2.shape}, dv1: {dv1.shape}, dv2: {dv2.shape}"
-        )
         return dq, dk1, dk2, dv1, dv2, None, None, None, None, None
 
 
